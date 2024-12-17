@@ -18,8 +18,13 @@ const (
 	timeFormat = "Jan 2 15:04:05"
 )
 
+type USDRate struct {
+	Buy  float64
+	Sell float64
+}
+
 type RateChecker struct {
-	lastRate  float64
+	USDRate   USDRate
 	botToken  string
 	channelID string
 	client    *http.Client
@@ -34,7 +39,7 @@ func NewRateChecker(botToken, channelID string) (*RateChecker, error) {
 	}
 
 	rc := &RateChecker{
-		lastRate:  0,
+		USDRate:   USDRate{},
 		botToken:  botToken,
 		channelID: channelID,
 		client: &http.Client{
@@ -47,70 +52,93 @@ func NewRateChecker(botToken, channelID string) (*RateChecker, error) {
 
 // CheckForRateChange checks if the rate has changed, and if so, sends a Telegram message.
 func (rc *RateChecker) CheckForRateChange(ctx context.Context) {
-	currRate, err := rc.fetchCurrentRate(ctx)
+	usdRate, err := rc.fetchCurrentRate(ctx)
 	if err != nil {
 		log.Printf("Error fetching current rate: %v\n", err)
 		return
 	}
 
 	// If there's no rate or zero, just log it. Zero might indicate a parsing issue.
-	if currRate == 0 {
+	if usdRate.Buy == 0 || usdRate.Sell == 0 {
 		log.Println("Fetched a rate of 0, which is unexpected; skipping message send.")
 		return
 	}
 
-	if currRate == rc.lastRate {
+	if usdRate.Buy == rc.USDRate.Buy && usdRate.Sell == rc.USDRate.Sell {
 		// No change in rate
 		return
 	}
 
-	rc.lastRate = currRate
-	if err := rc.sendTelegramMessage(ctx, currRate); err != nil {
+	rc.USDRate = usdRate
+	if err := rc.sendTelegramMessage(ctx, usdRate); err != nil {
 		log.Printf("Error sending Telegram message: %v\n", err)
 	}
 }
 
 // fetchCurrentRate retrieves the current exchange rate from the given URL.
-func (rc *RateChecker) fetchCurrentRate(ctx context.Context) (float64, error) {
+func (rc *RateChecker) fetchCurrentRate(ctx context.Context) (USDRate, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return 0, fmt.Errorf("creating request: %w", err)
+		return USDRate{}, fmt.Errorf("creating request: %w", err)
 	}
 
 	resp, err := rc.client.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("fetching URL: %w", err)
+		return USDRate{}, fmt.Errorf("fetching URL: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("received non-200 response code: %d", resp.StatusCode)
+		return USDRate{}, fmt.Errorf("received non-200 response code: %d", resp.StatusCode)
 	}
 
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
-		return 0, fmt.Errorf("parsing HTML: %w", err)
+		return USDRate{}, fmt.Errorf("parsing HTML: %w", err)
 	}
 
-	rateText := doc.Find("#sell-usd").Text()
-	if rateText == "" {
-		return 0, fmt.Errorf("exchange rate not found on the page")
-	}
+	var ret USDRate
+	doc.Find("tbody.first-table-body tr").Each(func(i int, s *goquery.Selection) {
+		// only parse USD
+		if i != 0 {
+			return
+		}
 
-	rateText = strings.TrimSpace(rateText)
-	currRate, err := strconv.ParseFloat(rateText, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid exchange rate: %w", err)
-	}
+		currency := s.Find("td.flag-title").Text()
 
-	return currRate, nil
+		// The currency values are likely in the subsequent cells:
+		// 0th "currency-value" td might be Buy,
+		// 1st "currency-value" td might be Sell (or vice versa).
+		buyStr := s.Find("td.currency-value").Eq(0).Text()
+		sellStr := s.Find("td.currency-value").Eq(1).Text()
+
+		// Replace the comma with a dot for proper float parsing
+		buyStr = strings.ReplaceAll(buyStr, ",", ".")
+		sellStr = strings.ReplaceAll(sellStr, ",", ".")
+
+		ret.Buy, err = strconv.ParseFloat(buyStr, 64)
+		if err != nil {
+			log.Printf("Error converting buyVal: %v", err)
+		}
+
+		ret.Sell, err = strconv.ParseFloat(sellStr, 64)
+		if err != nil {
+			log.Printf("Error converting sellVal: %v", err)
+		}
+
+		// Now buyVal and sellVal are floats you can work with.
+		fmt.Printf("Currency: %s, ყიდვა: %.4f, გაყიდვა: %.4f\n", currency, ret.Buy, ret.Sell)
+	})
+
+	return ret, nil
 }
 
 // sendTelegramMessage sends the current exchange rate message to the specified Telegram channel.
-func (rc *RateChecker) sendTelegramMessage(ctx context.Context, rate float64) error {
+func (rc *RateChecker) sendTelegramMessage(ctx context.Context, rate USDRate) error {
 	currentDate := time.Now().In(rc.location)
 	formattedTime := currentDate.Format(timeFormat)
-	messageText := fmt.Sprintf("%s - 1$ ღირს %.4f", formattedTime, rate)
+	messageText := fmt.Sprintf(`%s - 1$ USD 
+	ყიდვა: %.4f, გაყიდვა: %.4f`, formattedTime, rate.Buy, rate.Sell)
 
 	telegramURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", rc.botToken)
 
